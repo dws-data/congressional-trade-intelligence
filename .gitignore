@@ -1,9 +1,5 @@
-# All data (DB, source files, API keys)
+# Data
 data/
-
-# API keys and secrets
-
-# Large data files (can be regenerated)
 
 # Python
 __pycache__/
@@ -14,32 +10,22 @@ __pycache__/
 # Logs
 logs/
 
-# Job applications (personal)
+# Private
 job_applications/
-
-# Internal docs and whitepapers
 CLAUDE_CODE_HANDOFF.txt
 *.docx
-
-# QA / internal scripts
 qa/
-
-# ML (nothing to push yet)
 ml/
-
-# Analysis (private)
 analysis/
+.claude/
 
-# Dead code / unused scripts
+# Unused
 pipeline/congress_api_fetcher.py
 dashboard/app_3.py
 
-# Unredacted screenshots
+# Screenshots
 screenshots/leaderboard_2.png
 screenshots/profile_1.PNG
-
-# Claude Code internal
-.claude/
 
 # OS
 .DS_Store
