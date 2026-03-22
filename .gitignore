@@ -11,8 +11,6 @@ __pycache__/
 logs/
 
 # Private
-job_applications/
-CLAUDE_CODE_HANDOFF.txt
 *.docx
 qa/
 ml/
