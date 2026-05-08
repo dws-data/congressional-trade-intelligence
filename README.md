@@ -16,14 +16,24 @@ The core question: **after controlling for noise, do some politicians trade with
 
 ## Screenshots
 
-### Leaderboard
-![Leaderboard Overview](screenshots/leaderboard_1.png)
+### Dashboard Overview
+![Dashboard Overview](screenshots/leaderboard.png)
 
-### Leaderboard Table
-![Leaderboard Table](screenshots/leaderboard_2_edited.png)
+### Leaderboard
+![Leaderboard](screenshots/leaderboard_2.png)
 
 ### Politician Profile
-![Politician Profile](screenshots/profile_1_edited.png)
+![Politician Profile — Header](screenshots/profile.png)
+![Politician Profile — Committee & Drawdown](screenshots/profile_2.PNG)
+![Politician Profile — Trade History](screenshots/profile_3.PNG)
+
+### Pipeline — Scoring Filter Funnel
+![Filter Funnel Chart](screenshots/pipeline.png)
+![Filter Funnel Chart (full)](screenshots/pipeline_2.png)
+![Filter Funnel Table](screenshots/pipeline_3.png)
+
+### Pipeline — Coverage Stats
+![Asset Type Breakdown & Win Rate by Year](screenshots/pipeline_4.png)
 
 ---
 
