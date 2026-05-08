@@ -21,9 +21,6 @@ analysis/
 pipeline/congress_api_fetcher.py
 dashboard/app_3.py
 
-# Screenshots
-screenshots/leaderboard_2.png
-screenshots/profile_1.PNG
 
 # OS
 .DS_Store
