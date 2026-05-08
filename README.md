@@ -177,4 +177,4 @@ The SQLite database is not included in this repository (size + data sourcing). K
 
 ---
 
-*Independent research project. Not financial advice.*
+*Independent research project. Built with AI-assisted development. Architecture, analysis, and domain logic by the author. Not financial advice.*
