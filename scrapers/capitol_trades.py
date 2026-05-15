@@ -188,14 +188,17 @@ def parse_trades_from_page(html):
             # ── Cell 4: Filed After (lag days) ───
             filing_lag = parse_filing_lag(cells[4].get_text(strip=True))
 
-            # Cross-check: if we have both dates, recalculate lag
-            if trade_date and disc_date and not filing_lag:
+            # Always calculate from dates when available — CT's scraped "Filed After"
+            # uses exclusive counting (1 day short of calendar days). We store calendar
+            # days consistently across all sources. Fall back to scraped value only if
+            # trade_date is missing (e.g. politician reported a date range).
+            if trade_date and disc_date:
                 try:
                     td = datetime.strptime(trade_date, "%Y-%m-%d")
                     dd = datetime.strptime(disc_date,  "%Y-%m-%d")
                     filing_lag = (dd - td).days
                 except Exception:
-                    pass
+                    pass  # keep scraped value if date parsing fails
 
             # ── Cell 5: Owner ────────────────────
             owner = cells[5].get_text(strip=True).lower()
@@ -210,6 +213,8 @@ def parse_trades_from_page(html):
                 tx_type = "exchange"
             elif "option" in tx_raw:
                 tx_type = "option"
+            elif "receive" in tx_raw:
+                continue  # passive receipt (spin-off, distribution) — not a trading decision
             else:
                 tx_type = tx_raw
 
@@ -225,6 +230,11 @@ def parse_trades_from_page(html):
                     break
             if not trade_id:
                 trade_id = f"{pol_id}_{ticker}_{trade_date}".replace(" ", "_")
+
+            # Skip rows with no disclosure date or trade date — unpriceable,
+            # unscorable, and NULLs weaken the UNIQUE index.
+            if not disc_date or not trade_date:
+                continue
 
             trades.append({
                 "trade_id":         trade_id,
@@ -262,17 +272,22 @@ def upsert_politician(cursor, trade):
           trade["chamber"], trade["state"]))
 
 def upsert_trade(cursor, trade):
+    lag = trade["filing_lag_days"]
+    filing_violation = "violation" if (lag is not None and lag > 45) else "compliant"
+
     cursor.execute("""
         INSERT OR IGNORE INTO trades (
             trade_id, politician_id, ticker, company,
             trade_date, disclosure_date, filing_lag_days,
-            transaction_type, size_min, size_max, size_midpoint, owner
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            transaction_type, size_min, size_max, size_midpoint, owner,
+            filing_violation
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         trade["trade_id"],          trade["politician_id"],    trade["ticker"],
         trade["company"],           trade["trade_date"],       trade["disclosure_date"],
         trade["filing_lag_days"],   trade["transaction_type"], trade["size_min"],
         trade["size_max"],          trade["size_midpoint"],    trade["owner"],
+        filing_violation,
     ))
 
 # ─────────────────────────────────────────────
@@ -319,7 +334,7 @@ def run_scraper(max_pages=None, start_page=1, headless=True):
         end_page = min(start_page + max_pages - 1, total_pages) if max_pages else total_pages
 
         print(f"Total pages:    {total_pages}")
-        print(f"Scraping pages: {start_page} → {end_page}")
+        print(f"Scraping pages: {start_page} to {end_page}")
         if max_pages:
             print(f"(Test mode: {max_pages} pages)")
         print()

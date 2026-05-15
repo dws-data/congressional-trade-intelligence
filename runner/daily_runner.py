@@ -1,10 +1,16 @@
 # daily_runner.py
 # Orchestrates the full daily pipeline:
 #   1. Scrape new disclosures from Capitol Trades
-#   2. Fetch prices for new trades (yfinance)
-#   3. Recalculate drawdowns for new trades (OHLC path-based)
-#   4. Re-run scorer to update politician scores
-#   5. Write run log to logs/daily_run.log
+#   2. Build price paths for new trades (yfinance, --new-only)
+#   3. Classify asset_type for any new tickers (FMP)
+#   4. Recalculate drawdowns for new trades (OHLC path-based)
+#   5. Flag within-window repeat buys (repeat_buy_flagger)
+#   6. Re-run scorer to update politician scores
+#   7. Write run log to logs/daily_run.log
+#
+# NOTE: Single price-point fetching (price_at_disclosure_date) is no longer a
+# separate step. rebuild_all_paths re-fetches entry prices from yfinance on the
+# same split-adjusted basis as the path data.
 #
 # Usage (run from project root):
 #   python runner/daily_runner.py
@@ -83,7 +89,7 @@ def get_new_trades_since(last_run_date):
 # ─────────────────────────────────────────────
 
 def step_scrape():
-    log_section("STEP 1 / 4 — SCRAPE NEW DISCLOSURES")
+    log_section("STEP 1 / 5 — SCRAPE NEW DISCLOSURES")
     try:
         from scrapers.capitol_trades import run_scraper
         before_total, _, _, _ = get_trade_counts()
@@ -106,59 +112,110 @@ def step_scrape():
         raise
 
 # ─────────────────────────────────────────────
-# STEP 2: FETCH PRICES
+# STEP 2a: BUILD PATHS FOR NEW TRADES
 # ─────────────────────────────────────────────
 
-def step_fetch_prices():
-    log_section("STEP 2 / 4 — FETCH PRICES FOR NEW TRADES")
+def step_build_new_paths():
+    log_section("STEP 2a / 6 — BUILD PATHS FOR NEW TRADES")
     try:
-        from pipeline.price_fetcher import run_price_fetcher
-
-        # Count trades missing prices before
-        conn = sqlite3.connect(DB_PATH)
-        c    = conn.cursor()
-        c.execute("""
-            SELECT COUNT(*) FROM trades
-            WHERE transaction_type = 'buy'
-            AND ticker != ''
-            AND price_at_disclosure_date IS NULL
-        """)
-        missing_before = c.fetchone()[0]
-        conn.close()
-
-        log(f"Trades missing disc price: {missing_before:,}")
-
-        if missing_before == 0:
-            log("No new prices needed — skipping")
-            return 0
-
-        run_price_fetcher()
-
-        conn = sqlite3.connect(DB_PATH)
-        c    = conn.cursor()
-        c.execute("""
-            SELECT COUNT(*) FROM trades
-            WHERE transaction_type = 'buy'
-            AND ticker != ''
-            AND price_at_disclosure_date IS NULL
-        """)
-        missing_after = c.fetchone()[0]
-        conn.close()
-
-        fetched = missing_before - missing_after
-        log(f"Prices fetched: {fetched:,}  (still missing: {missing_after:,})")
-        return fetched
-
+        from pipeline.extend_price_paths import build_new_paths
+        inserted = build_new_paths(db_path=DB_PATH)
+        log(f"Path rows inserted: {inserted:,}")
+        return inserted
     except Exception as e:
-        log(f"ERROR in price fetch step: {e}")
+        log(f"ERROR in build new paths step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 2b: EXTEND PATHS FOR OPEN TRADES
+# ─────────────────────────────────────────────
+
+def step_extend_open_paths():
+    log_section("STEP 2b / 6 — EXTEND PATHS FOR OPEN TRADES")
+    try:
+        from pipeline.extend_price_paths import extend_open_paths
+        appended = extend_open_paths(db_path=DB_PATH)
+        log(f"Path rows appended: {appended:,}")
+        return appended
+    except Exception as e:
+        log(f"ERROR in extend paths step: {e}")
         raise
 
 # ─────────────────────────────────────────────
-# STEP 3: DRAWDOWN CALCULATOR
+# STEP 2c: TRADE DATE PRICES
+# ─────────────────────────────────────────────
+
+def step_trade_date_prices():
+    log_section("STEP 2c / 6 — TRADE DATE PRICES")
+    try:
+        from pipeline.trade_date_prices import run as run_trade_date_prices
+
+        conn = sqlite3.connect(DB_PATH)
+        c    = conn.cursor()
+        c.execute("""
+            SELECT COUNT(*) FROM trades
+            WHERE trade_date IS NOT NULL AND trade_date != ''
+              AND price_at_trade_date IS NULL
+              AND (price_fetch_failed IS NULL OR price_fetch_failed = 0)
+        """)
+        missing = c.fetchone()[0]
+        conn.close()
+
+        if missing == 0:
+            log("All trade-date prices populated — skipping")
+            return 0, 0
+
+        log(f"Trades missing price_at_trade_date: {missing:,}")
+        price_updated, pct_updated = run_trade_date_prices(db_path=DB_PATH)
+        log(f"Trade-date prices set: {price_updated:,}  pct_move updated: {pct_updated:,}")
+        return price_updated, pct_updated
+
+    except Exception as e:
+        log(f"ERROR in trade date prices step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 3: ASSET TYPE CLASSIFIER
+# ─────────────────────────────────────────────
+
+def step_classify_assets():
+    log_section("STEP 3 / 6 — CLASSIFY ASSET TYPES")
+    try:
+        from pipeline.asset_type_fetcher import fetch_asset_types
+
+        conn = sqlite3.connect(DB_PATH)
+        c    = conn.cursor()
+        c.execute("""
+            SELECT COUNT(DISTINCT ticker) FROM trades
+            WHERE ticker IS NOT NULL AND ticker != ''
+              AND asset_type IS NULL
+        """)
+        unclassified = c.fetchone()[0]
+
+        if unclassified == 0:
+            log("All tickers classified — skipping")
+            conn.close()
+            return
+
+        log(f"Unclassified tickers: {unclassified:,}")
+        counts = fetch_asset_types(conn, c)
+        conn.close()
+        log(f"Classified: stock={counts['stock']}  etf={counts['etf']}  "
+            f"fund={counts['fund']}  other={counts['other']}  error={counts['error']}")
+
+    except Exception as e:
+        log(f"ERROR in asset type step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 4: DRAWDOWN CALCULATOR
 # ─────────────────────────────────────────────
 
 def step_drawdown():
-    log_section("STEP 3 / 4 — RECALCULATE DRAWDOWNS")
+    log_section("STEP 4 / 6 — RECALCULATE DRAWDOWNS")
     try:
         from pipeline.drawdown_calculator import run_drawdown_calculator
 
@@ -176,10 +233,8 @@ def step_drawdown():
 
         log(f"Trades missing drawdown: {missing_before:,}")
 
-        if missing_before == 0:
-            log("No new drawdowns needed — skipping")
-            return 0
-
+        # Always run — calculator overwrites all existing values using MOO entry.
+        # Skipping when missing==0 would leave stale disc-close-based values in place.
         run_drawdown_calculator()
 
         conn = sqlite3.connect(DB_PATH)
@@ -202,11 +257,102 @@ def step_drawdown():
         raise
 
 # ─────────────────────────────────────────────
-# STEP 4: SCORER
+# STEP 4b: SECTOR + COMMITTEE RELEVANCE
+# ─────────────────────────────────────────────
+
+def step_market_features():
+    log_section("STEP 4c / 6 — MARKET FEATURES")
+    try:
+        from pipeline.market_features import run as run_market_features
+
+        conn   = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM market_features") if cursor.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='market_features'"
+        ).fetchone() else None
+        conn.close()
+
+        run_market_features(rebuild=False)
+
+        conn   = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM market_features")
+        total = cursor.fetchone()[0]
+        conn.close()
+        log(f"Market features rows: {total:,}")
+
+    except Exception as e:
+        log(f"ERROR in market features step: {e}")
+        raise
+
+
+def step_sector_and_committee():
+    log_section("STEP 4b / 6 — SECTOR + COMMITTEE RELEVANCE")
+    try:
+        from pipeline.sector_fetcher import fetch_ticker_data, flag_committee_relevance
+
+        conn   = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute("""
+            SELECT COUNT(DISTINCT ticker) FROM trades
+            WHERE ticker != '' AND ticker IS NOT NULL AND industry IS NULL
+        """)
+        missing = cursor.fetchone()[0]
+
+        if missing == 0:
+            log("All tickers have industry data — re-flagging committee relevance only")
+        else:
+            log(f"Tickers missing industry: {missing:,} — fetching/propagating now")
+            fetch_ticker_data(conn, cursor)
+
+        flag_committee_relevance(conn, cursor)
+
+        cursor.execute("SELECT COUNT(*) FROM trades WHERE committee_relevance IS NOT NULL")
+        flagged = cursor.fetchone()[0]
+        conn.close()
+
+        log(f"Committee-relevant trades: {flagged:,}")
+
+    except Exception as e:
+        log(f"ERROR in sector/committee step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 5: REPEAT BUY FLAGGER
+# ─────────────────────────────────────────────
+
+def step_flag_repeats():
+    log_section("STEP 5a / 6 — FLAG WITHIN-WINDOW REPEAT BUYS")
+    try:
+        from pipeline.repeat_buy_flagger import run_repeat_buy_flagger
+        run_repeat_buy_flagger()
+    except Exception as e:
+        log(f"ERROR in repeat buy flagger step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 5b: CLUSTER COUNT
+# ─────────────────────────────────────────────
+
+def step_cluster_count():
+    log_section("STEP 5b / 6 — CLUSTER COUNT")
+    try:
+        from pipeline.cluster_count import run_cluster_count
+        run_cluster_count(db_path=DB_PATH)
+    except Exception as e:
+        log(f"ERROR in cluster count step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
+# STEP 5: SCORER
 # ─────────────────────────────────────────────
 
 def step_score():
-    log_section("STEP 4 / 4 — UPDATE SCORES")
+    log_section("STEP 6 / 6 — UPDATE SCORES")
     try:
         from pipeline.scorer import run_scorer
 
@@ -254,12 +400,13 @@ def run(skip_scrape=False, score_only=False):
         f"{scored_before} scored  |  latest: {latest_before}")
     log("")
 
-    new_trades  = 0
-    fetched     = 0
-    calculated  = 0
+    new_trades   = 0
+    paths_built  = 0
+    paths_ext    = 0
+    calculated   = 0
 
     if score_only:
-        log("Mode: SCORE ONLY — skipping scrape, prices, drawdown")
+        log("Mode: SCORE ONLY — skipping scrape, paths, drawdown")
         scored = step_score()
     else:
         if not skip_scrape:
@@ -267,9 +414,16 @@ def run(skip_scrape=False, score_only=False):
         else:
             log("Skipping scrape (--skip-scrape flag set)")
 
-        fetched    = step_fetch_prices()
-        calculated = step_drawdown()
-        scored     = step_score()
+        paths_built = step_build_new_paths()
+        paths_ext   = step_extend_open_paths()
+        step_trade_date_prices()
+        step_classify_assets()
+        calculated  = step_drawdown()
+        step_market_features()
+        step_sector_and_committee()
+        step_flag_repeats()
+        step_cluster_count()
+        scored      = step_score()
 
     # ── Final summary ─────────────────────────
     elapsed = (datetime.now() - start).total_seconds()
@@ -277,13 +431,14 @@ def run(skip_scrape=False, score_only=False):
 
     log("")
     log_section("RUN COMPLETE")
-    log(f"Duration:        {elapsed:.0f}s")
-    log(f"New trades:      {new_trades:,}")
-    log(f"Prices fetched:  {fetched:,}")
-    log(f"Drawdowns calc:  {calculated:,}")
-    log(f"Politicians:     {scored_after} scored")
-    log(f"Latest disc:     {latest_after}")
-    log(f"Total trades:    {total_after:,}  (was {total_before:,})")
+    log(f"Duration:          {elapsed:.0f}s")
+    log(f"New trades:        {new_trades:,}")
+    log(f"Paths built (new): {paths_built:,}")
+    log(f"Paths extended:    {paths_ext:,}")
+    log(f"Drawdowns calc:    {calculated:,}")
+    log(f"Politicians:       {scored_after} scored")
+    log(f"Latest disc:       {latest_after}")
+    log(f"Total trades:      {total_after:,}  (was {total_before:,})")
     log("")
 
 

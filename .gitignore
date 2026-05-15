@@ -10,17 +10,24 @@ __pycache__/
 # Logs
 logs/
 
-# Private
+# Private / internal
 *.docx
 qa/
 ml/
 analysis/
 .claude/
+diary/
+issues_and_fixes/
+operations/
+dashboard/backups/
+TODO.md
+
+# Screenshots — internal only
+screenshots/taken_before_fmp_fuck_up.PNG
 
 # Unused
 pipeline/congress_api_fetcher.py
 dashboard/app_3.py
-
 
 # OS
 .DS_Store

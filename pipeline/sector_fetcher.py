@@ -64,8 +64,20 @@ def fetch_ticker_data(conn, cursor):
     ticker_data = {}
     failed      = 0
     succeeded   = 0
+    propagated  = 0
 
     for i, ticker in enumerate(tickers):
+        # Check if industry already known from other rows (new scrape added rows for existing ticker)
+        cursor.execute(
+            "SELECT sector, industry FROM trades WHERE ticker = ? AND industry IS NOT NULL LIMIT 1",
+            (ticker,)
+        )
+        existing = cursor.fetchone()
+        if existing:
+            ticker_data[ticker] = (existing[0], existing[1])
+            propagated += 1
+            continue
+
         try:
             info     = yf.Ticker(ticker).info
             sector   = info.get("sector",   None)
@@ -82,7 +94,7 @@ def fetch_ticker_data(conn, cursor):
         time.sleep(DELAY)
 
         if (i + 1) % 100 == 0:
-            print(f"    [{i+1:4d}/{len(tickers)}] OK: {succeeded:,}  No data: {failed:,}  Last: {ticker}")
+            print(f"    [{i+1:4d}/{len(tickers)}] OK: {succeeded:,}  Propagated: {propagated:,}  No data: {failed:,}  Last: {ticker}")
 
     # Write to DB — update sector (if missing) and industry for each ticker
     updated = 0
@@ -96,7 +108,7 @@ def fetch_ticker_data(conn, cursor):
         updated += 1
 
     conn.commit()
-    print(f"\n  Industry fetched: {succeeded:,} | No data: {failed:,}")
+    print(f"\n  Industry fetched (yfinance): {succeeded:,} | Propagated from existing: {propagated:,} | No data: {failed:,}")
     return ticker_data
 
 # ─────────────────────────────────────────────────────────────────

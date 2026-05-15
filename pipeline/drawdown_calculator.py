@@ -95,13 +95,14 @@ def analyse_trade_ohlc(path_rows, entry_price):
 # MAIN RUNNER
 # ─────────────────────────────────────────────
 
-def run_drawdown_calculator():
+def run_drawdown_calculator(db_path=None):
     """
     Recalculate all drawdown metrics for every buy trade
     using intraday OHLC from trade_price_paths.
     Overwrites existing values.
     """
-    conn   = sqlite3.connect(DB_PATH)
+    db     = db_path if db_path else DB_PATH
+    conn   = sqlite3.connect(db)
     cursor = conn.cursor()
 
     print("=" * 60)
@@ -126,20 +127,33 @@ def run_drawdown_calculator():
     trades = cursor.fetchall()
     print(f"Trades to process: {len(trades):,}")
 
+    # ── Fetch day-1 opens (MOO entry for disc anchor) ────
+    print("Loading day-1 opens (MOO entry prices)...")
+    cursor.execute("""
+        SELECT trade_id, open
+        FROM trade_price_paths
+        WHERE anchor = 'disc' AND day = 1
+        AND open IS NOT NULL AND open > 0
+    """)
+    day1_open_lookup = {r[0]: r[1] for r in cursor.fetchall()}
+    print(f"Day-1 opens loaded: {len(day1_open_lookup):,}")
+
     # ── Fetch all path rows in bulk ───────────
     print("Loading price paths...")
     cursor.execute("""
-        SELECT trade_id, anchor, day, high, low, close
+        SELECT trade_id, anchor, day, date, high, low, close
         FROM trade_price_paths
         ORDER BY trade_id, anchor, day ASC
     """)
     all_paths = cursor.fetchall()
     print(f"Path rows loaded:  {len(all_paths):,}")
 
-    # Group by trade_id and anchor
+    # Group by trade_id and anchor; also build date lookup for close_date
     paths = defaultdict(lambda: defaultdict(list))
-    for trade_id, anchor, day, high, low, close in all_paths:
+    date_lookup = {}  # (trade_id, anchor, day) -> calendar date string
+    for trade_id, anchor, day, date, high, low, close in all_paths:
         paths[trade_id][anchor].append((day, high, low, close))
+        date_lookup[(trade_id, anchor, day)] = date
 
     # ── Process each trade ────────────────────
     print("\nCalculating...\n")
@@ -162,9 +176,11 @@ def run_drawdown_calculator():
             elif trade_result["outcome"] == "loss": losses_trade += 1
             else:                                   open_trade   += 1
 
-        if price_disc and paths[trade_id]["disc"]:
+        # Use day-1 open (MOO entry) for disc anchor; fall back to disc close
+        entry_disc = day1_open_lookup.get(trade_id) or price_disc
+        if entry_disc and paths[trade_id]["disc"]:
             disc_result = analyse_trade_ohlc(
-                paths[trade_id]["disc"], price_disc
+                paths[trade_id]["disc"], entry_disc
             )
             if disc_result["outcome"] == "win":   wins_disc   += 1
             elif disc_result["outcome"] == "loss": losses_disc += 1
@@ -175,19 +191,24 @@ def run_drawdown_calculator():
             processed += 1
             continue
 
+        close_date_disc = None
+        if disc_result and disc_result["days_to_exit"] is not None:
+            close_date_disc = date_lookup.get((trade_id, "disc", disc_result["days_to_exit"]))
+
         if trade_result and disc_result:
             cursor.execute("""
                 UPDATE trades SET
                     max_drawdown_before_profit = ?,
-                    days_to_profitability      = ?,
+                    days_to_exit_trade         = ?,
                     drawdown_threshold_5pct    = ?,
                     drawdown_threshold_10pct   = ?,
                     drawdown_threshold_15pct   = ?,
                     max_drawdown_disc          = ?,
-                    days_to_profitability_disc = ?,
+                    days_to_exit_disc          = ?,
                     drawdown_disc_5pct         = ?,
                     drawdown_disc_10pct        = ?,
-                    drawdown_disc_15pct        = ?
+                    drawdown_disc_15pct        = ?,
+                    close_date_disc            = ?
                 WHERE trade_id = ?
             """, (
                 trade_result["max_drawdown"],
@@ -200,13 +221,14 @@ def run_drawdown_calculator():
                 disc_result["hit_5pct"],
                 disc_result["hit_10pct"],
                 disc_result["hit_15pct"],
+                close_date_disc,
                 trade_id,
             ))
         elif trade_result:
             cursor.execute("""
                 UPDATE trades SET
                     max_drawdown_before_profit = ?,
-                    days_to_profitability      = ?,
+                    days_to_exit_trade         = ?,
                     drawdown_threshold_5pct    = ?,
                     drawdown_threshold_10pct   = ?,
                     drawdown_threshold_15pct   = ?
@@ -223,10 +245,11 @@ def run_drawdown_calculator():
             cursor.execute("""
                 UPDATE trades SET
                     max_drawdown_disc          = ?,
-                    days_to_profitability_disc = ?,
+                    days_to_exit_disc          = ?,
                     drawdown_disc_5pct         = ?,
                     drawdown_disc_10pct        = ?,
-                    drawdown_disc_15pct        = ?
+                    drawdown_disc_15pct        = ?,
+                    close_date_disc            = ?
                 WHERE trade_id = ?
             """, (
                 disc_result["max_drawdown"],
@@ -234,6 +257,7 @@ def run_drawdown_calculator():
                 disc_result["hit_5pct"],
                 disc_result["hit_10pct"],
                 disc_result["hit_15pct"],
+                close_date_disc,
                 trade_id,
             ))
 
@@ -272,16 +296,21 @@ def run_drawdown_calculator():
     print(f"  FROM TRADE DATE:")
     print(f"    Wins: {wins_trade:,}  Losses: {losses_trade:,}  Open: {open_trade:,}")
     print(f"    Avg drawdown on winning trades:  {row[0]}%")
-    print(f"    Hit 5%  drawdown: {row[2]:,}")
-    print(f"    Hit 10% drawdown: {row[4]:,}")
+    print(f"    Hit 5%  drawdown: {(row[2] or 0):,}")
+    print(f"    Hit 10% drawdown: {(row[4] or 0):,}")
     print()
     print(f"  FROM DISC DATE:")
     print(f"    Wins: {wins_disc:,}  Losses: {losses_disc:,}  Open: {open_disc:,}")
     print(f"    Avg drawdown on winning trades:  {row[1]}%")
-    print(f"    Hit 5%  drawdown: {row[3]:,}")
-    print(f"    Hit 10% drawdown: {row[5]:,}")
+    print(f"    Hit 5%  drawdown: {(row[3] or 0):,}")
+    print(f"    Hit 10% drawdown: {(row[5] or 0):,}")
     print("=" * 60)
 
 
 if __name__ == "__main__":
-    run_drawdown_calculator()
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--db", default=None,
+                        help="DB path override (default: data/trades.db)")
+    args = parser.parse_args()
+    run_drawdown_calculator(db_path=args.db)

@@ -122,16 +122,18 @@ def normalise_drawdown(avg_drawdown):
     Convert avg max drawdown (negative %) to 0-100 score.
     Anchored so that:
       - 0% drawdown   = 100 (never goes negative)
-      - -15% drawdown = 0   (very painful to hold)
+      - -10% drawdown = 0   (held to the edge of the stop before recovering)
     Linear interpolation.
+    Only drawdowns in the range (-10, 0) are passed in — trades that hit
+    the -10% stop are losses and filtered out before this function is called.
     """
     if avg_drawdown is None:
         return 50.0  # neutral if no data
     if avg_drawdown >= 0:
         return 100.0
-    if avg_drawdown <= -15.0:
+    if avg_drawdown <= -10.0:
         return 0.0
-    return (avg_drawdown + 15.0) / 15.0 * 100
+    return (avg_drawdown + 10.0) / 10.0 * 100
 
 # ─────────────────────────────────────────────
 # SCORE A SINGLE 
@@ -258,6 +260,7 @@ def fetch_trades_by_pol(cursor, asset_filter_sql):
         AND trade_date IS NOT NULL
         AND trade_date != ''
         AND (price_fetch_failed IS NULL OR price_fetch_failed = 0)
+        AND (repeat_before_close IS NULL OR repeat_before_close = 0)
         {asset_filter_sql}
         AND (politician_id, trade_date) NOT IN (
             SELECT politician_id, trade_date
@@ -281,11 +284,27 @@ def fetch_trades_by_pol(cursor, asset_filter_sql):
         )
         GROUP BY politician_id, ticker, disclosure_date, price_at_disclosure_date
     """)
+    rows = cursor.fetchall()
+
+    # Bulk fetch day-1 opens (MOO entry) for all trade_ids
+    trade_ids    = [r[0] for r in rows]
+    placeholders = ",".join("?" * len(trade_ids))
+    cursor.execute(f"""
+        SELECT trade_id, open
+        FROM trade_price_paths
+        WHERE anchor = 'disc' AND day = 1
+        AND open IS NOT NULL AND open > 0
+        AND trade_id IN ({placeholders})
+    """, trade_ids)
+    day1_opens = {r[0]: r[1] for r in cursor.fetchall()}
+
     trades_by_pol = {}
-    for trade_id, pol_id, price, size, dd in cursor.fetchall():
+    for trade_id, pol_id, price, size, dd in rows:
+        # Use day-1 open (MOO entry); fall back to disc close if missing
+        entry = day1_opens.get(trade_id) or price
         if pol_id not in trades_by_pol:
             trades_by_pol[pol_id] = []
-        trades_by_pol[pol_id].append((trade_id, price, size, dd))
+        trades_by_pol[pol_id].append((trade_id, entry, size, dd))
     return trades_by_pol
 
 
@@ -376,7 +395,8 @@ def run_scorer():
     cursor.execute("""
         UPDATE politicians SET
             score = NULL, win_rate_trade = NULL, total_trades = NULL,
-            score_etf = NULL, win_rate_etf = NULL, etf_trade_count = NULL
+            score_etf = NULL, win_rate_etf = NULL, etf_trade_count = NULL,
+            avg_dd = NULL, large_trade_wr = NULL
     """)
 
     for pol_id, name, party, chamber, sr, er in scored:
@@ -388,18 +408,69 @@ def run_scorer():
                 score_etf       = ?,
                 win_rate_etf    = ?,
                 etf_trade_count = ?,
+                avg_dd          = ?,
+                large_trade_wr  = ?,
                 last_updated    = ?
             WHERE politician_id = ?
         """, (
-            sr["score"]       if sr else None,
-            sr["win_rate"]    if sr else None,
-            sr["total_trades"] if sr else None,
-            er["score"]       if er else None,
-            er["win_rate"]    if er else None,
-            er["total_trades"] if er else None,
+            sr["score"]          if sr else None,
+            sr["win_rate"]       if sr else None,
+            sr["total_trades"]   if sr else None,
+            er["score"]          if er else None,
+            er["win_rate"]       if er else None,
+            er["total_trades"]   if er else None,
+            sr["avg_drawdown"]   if sr else None,
+            sr["large_win_rate"] if sr else None,
             datetime.now().strftime("%Y-%m-%d"),
             pol_id,
         ))
+
+    # ── Precompute dashboard stats (filing lag, committee alignment) ──
+    print("Precomputing dashboard stats...")
+
+    # ct, afl, ca — from compliant trades only
+    cursor.execute("""
+        UPDATE politicians SET
+            compliant_trades_all = sub.ct,
+            avg_filing_lag       = sub.afl,
+            comm_aligned         = sub.ca
+        FROM (
+            SELECT
+                politician_id,
+                COUNT(*)                                                          as ct,
+                ROUND(AVG(CASE WHEN filing_lag_days <= 45 THEN filing_lag_days END), 1) as afl,
+                SUM(CASE WHEN committee_relevance = 1 THEN 1 ELSE 0 END) as ca
+            FROM (
+                SELECT politician_id, ticker, disclosure_date, price_at_disclosure_date,
+                       MAX(filing_lag_days)   as filing_lag_days,
+                       MAX(CASE WHEN committee_relevance IS NOT NULL THEN 1 ELSE 0 END) as committee_relevance
+                FROM trades
+                WHERE transaction_type  = 'buy'
+                AND   filing_violation  = 'compliant'
+                AND   price_at_disclosure_date IS NOT NULL
+                AND   disclosure_date IS NOT NULL AND disclosure_date != ''
+                GROUP BY politician_id, ticker, disclosure_date, price_at_disclosure_date
+            )
+            GROUP BY politician_id
+        ) sub
+        WHERE politicians.politician_id = sub.politician_id
+    """)
+
+    # late_filings — count of buy trades that are NOT compliant (across all trades, not just priced)
+    cursor.execute("""
+        UPDATE politicians SET
+            late_filings = sub.lf
+        FROM (
+            SELECT politician_id,
+                   COUNT(*) as lf
+            FROM trades
+            WHERE transaction_type = 'buy'
+              AND filing_violation != 'compliant'
+              AND filing_violation IS NOT NULL
+            GROUP BY politician_id
+        ) sub
+        WHERE politicians.politician_id = sub.politician_id
+    """)
 
     conn.commit()
 
@@ -429,10 +500,22 @@ def run_scorer():
 
     stock_scored = sum(1 for _, _, _, _, sr, _ in scored if sr)
     etf_scored   = sum(1 for _, _, _, _, _, er in scored if er)
+
+    total_wins   = sum(sr["wins"]   for _, _, _, _, sr, _ in scored if sr)
+    total_losses = sum(sr["losses"] for _, _, _, _, sr, _ in scored if sr)
+    total_opens  = sum(sr["opens"]  for _, _, _, _, sr, _ in scored if sr)
+    total_trades_all = total_wins + total_losses + total_opens
+
     print(f"\n  Politicians with stock score: {stock_scored:,}")
     print(f"  Politicians with ETF score:   {etf_scored:,}")
     print(f"  Below threshold:              {below_min:,} (< {MIN_TRADES} trades in both)")
     print(f"  No trades:                    {no_trades:,}")
+    print(f"\n  Stock trade outcomes:")
+    print(f"    Wins:   {total_wins:,}")
+    print(f"    Losses: {total_losses:,}")
+    print(f"    Opens:  {total_opens:,}  ({total_opens/total_trades_all*100:.1f}% unresolved)")
+    print(f"    Win rate (wins / all):     {total_wins/total_trades_all*100:.1f}%")
+    print(f"    Win rate (wins / decided): {total_wins/(total_wins+total_losses)*100:.1f}%")
     if scored and scored[0][4]:
         print(f"\n  Top stock scorer: {scored[0][1]} — {scored[0][4]['score']:.1f}")
     print("=" * 60)
