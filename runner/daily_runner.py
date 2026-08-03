@@ -2,7 +2,7 @@
 # Orchestrates the full daily pipeline:
 #   1. Scrape new disclosures from Capitol Trades
 #   2. Build price paths for new trades (yfinance, --new-only)
-#   3. Classify asset_type for any new tickers (FMP)
+#   3. Classify asset_type for any new tickers (yfinance)
 #   4. Recalculate drawdowns for new trades (OHLC path-based)
 #   5. Flag within-window repeat buys (repeat_buy_flagger)
 #   6. Re-run scorer to update politician scores

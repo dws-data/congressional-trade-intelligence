@@ -17,17 +17,21 @@ import sqlite3
 import time
 import re
 import json
+import os
 import argparse
 from datetime import datetime
 from difflib import SequenceMatcher
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-API_KEY      = "gevbyG5hFgMausKgFCpKWhLIeBEecrhg"
+API_KEY      = os.environ["FMP_API_KEY"]
 DB_PATH      = "data/trades.db"
 CUTOFF_DATE  = "2018-01-01"          # don't fetch older than this
 REQUEST_DELAY = 0.25                 # seconds between API calls (300/min limit)

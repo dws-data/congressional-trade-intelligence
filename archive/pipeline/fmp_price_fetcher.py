@@ -25,16 +25,20 @@
 import requests
 import sqlite3
 import time
+import os
 import argparse
 from datetime import datetime, timedelta, date
 from collections import defaultdict
 from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-API_KEY        = "gevbyG5hFgMausKgFCpKWhLIeBEecrhg"
+API_KEY        = os.environ["FMP_API_KEY"]
 DB_PATH        = "data/trades.db"
 REQUEST_DELAY  = 0.22          # ~270 calls/min, comfortably under 300 limit
 BATCH_SIZE     = 200           # commit every N tickers
