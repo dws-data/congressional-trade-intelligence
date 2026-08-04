@@ -348,6 +348,49 @@ def step_cluster_count():
 
 
 # ─────────────────────────────────────────────
+# STEP 5c: FLAG WOULD-FOLLOW TRADES
+# ─────────────────────────────────────────────
+
+def step_signal_flag():
+    log_section("STEP 5c / 6 — FLAG WOULD-FOLLOW TRADES")
+    try:
+        from pipeline.signal_flagger import run_signal_flagger, mark_notified
+        from runner.notifier import send_email
+
+        total_flagged, newly_flagged = run_signal_flagger(db_path=DB_PATH)
+        log(f"Total would-follow trades flagged: {total_flagged:,}")
+
+        if not newly_flagged:
+            log("No new would-follow trades since last run")
+            return 0
+
+        log(f"New would-follow trades: {len(newly_flagged)}")
+        lines = []
+        for trade_id, ticker, pol_name, disc_date, cluster_ct, abs_move in newly_flagged:
+            line = f"  {ticker} — {pol_name} — disclosed {disc_date} (cluster={cluster_ct}, move={abs_move:.1f}%)"
+            log(line)
+            lines.append(line)
+
+        subject = f"Congressional Trade Tracker — {len(newly_flagged)} new would-follow trade(s)"
+        body = (
+            f"{len(newly_flagged)} new trade(s) meet the live execution filter "
+            f"(cluster_count_td >= 2 AND abs_pct_move_before_disclosure >= 15):\n\n"
+            + "\n".join(lines) +
+            "\n\nSee execution/rules.md for the filter definition and the dashboard's "
+            "WOULD FOLLOW tab for live status."
+        )
+        sent = send_email(subject, body)
+        log(f"Notification email {'sent' if sent else 'NOT sent (see warning above)'}")
+
+        mark_notified([row[0] for row in newly_flagged], db_path=DB_PATH)
+        return len(newly_flagged)
+
+    except Exception as e:
+        log(f"ERROR in signal flag step: {e}")
+        raise
+
+
+# ─────────────────────────────────────────────
 # STEP 5: SCORER
 # ─────────────────────────────────────────────
 
@@ -423,6 +466,7 @@ def run(skip_scrape=False, score_only=False):
         step_sector_and_committee()
         step_flag_repeats()
         step_cluster_count()
+        step_signal_flag()
         scored      = step_score()
 
     # ── Final summary ─────────────────────────

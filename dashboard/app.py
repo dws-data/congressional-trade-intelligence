@@ -675,6 +675,50 @@ def load_feed_stats(days_back=7):
     return total_trades, unique_pols, latest, high_score_trades
 
 
+@st.cache_data(ttl=300)
+def load_would_follow():
+    """
+    Trades flagged by pipeline/signal_flagger.py — meet the live execution filter
+    (execution/rules.md: cluster_count_td >= 2 AND abs_pct_move_before_disclosure >= 15).
+
+    Outcome derivation (consistent with load_committee_stats / fast-path 10/10 sim):
+      loss: max_drawdown_disc <= -10
+      win:  max_drawdown_disc > -10  AND days_to_exit_disc IS NOT NULL
+      open: max_drawdown_disc IS NULL OR days_to_exit_disc IS NULL (still running)
+    """
+    conn = sqlite3.connect(DB_PATH)
+    df = pd.read_sql_query("""
+        SELECT
+            t.trade_id,
+            t.disclosure_date,
+            t.trade_date,
+            t.ticker,
+            t.company,
+            t.size_midpoint,
+            t.price_at_disclosure_date AS entry_price,
+            t.cluster_count_td,
+            t.abs_pct_move_before_disclosure,
+            t.max_drawdown_disc,
+            t.days_to_exit_disc,
+            p.name    AS politician,
+            p.party,
+            p.chamber,
+            p.score,
+            CASE
+                WHEN t.max_drawdown_disc IS NULL THEN 'open'
+                WHEN t.max_drawdown_disc <= -10 THEN 'loss'
+                WHEN t.days_to_exit_disc IS NOT NULL THEN 'win'
+                ELSE 'open'
+            END AS outcome
+        FROM trades t
+        JOIN politicians p ON t.politician_id = p.politician_id
+        WHERE t.signal_flag = 1
+        ORDER BY t.disclosure_date DESC
+    """, conn)
+    conn.close()
+    return df
+
+
 @st.cache_data(ttl=3600, persist="disk")
 def load_pipeline_funnel():
     """
@@ -1479,7 +1523,7 @@ def render_leaderboard(stop_pct=10, target_pct=10, min_size=0):
     st.markdown('<div class="dash-title">POLITICIAN LEADERBOARD</div>', unsafe_allow_html=True)
     st.markdown('<div class="dash-subtitle">10% Stop / 10% Target · Market-on-Open Entry (Day-1) · '
                 'Compliant Trades Only</div>', unsafe_allow_html=True)
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["  LEADERBOARD  ", "  FEED  ", "  METHODOLOGY  ", "  COMMITTEES  ", "  PIPELINE  "])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["  LEADERBOARD  ", "  FEED  ", "  METHODOLOGY  ", "  COMMITTEES  ", "  PIPELINE  ", "  WOULD FOLLOW  "])
 
     with tab2:
         st.markdown("<br>", unsafe_allow_html=True)
@@ -1996,6 +2040,160 @@ def render_leaderboard(stop_pct=10, target_pct=10, min_size=0):
                 </tr></thead>
                 <tbody>{yr_rows}</tbody>
             </table></div>""")
+
+    with tab6:
+        st.markdown("<br>", unsafe_allow_html=True)
+        st.markdown('<div class="dash-header">WOULD FOLLOW</div>', unsafe_allow_html=True)
+        st.markdown("""
+        <div style="font-family:IBM Plex Mono,monospace;font-size:12px;color:#888;
+                    line-height:1.8;margin-bottom:16px">
+            Trades that meet the live execution filter (execution/rules.md):
+            cluster_count_td &ge; 2 AND abs_pct_move_before_disclosure &ge; 15%.
+            These are the trades the strategy would actually have taken.
+        </div>
+        """, unsafe_allow_html=True)
+
+        wf_df = load_would_follow()
+
+        wf_wins   = len(wf_df[wf_df["outcome"] == "win"])   if len(wf_df) else 0
+        wf_losses = len(wf_df[wf_df["outcome"] == "loss"])  if len(wf_df) else 0
+        wf_opens  = len(wf_df[wf_df["outcome"] == "open"])  if len(wf_df) else 0
+        wf_decided = wf_wins + wf_losses
+        wf_wr      = wf_wins / wf_decided * 100 if wf_decided > 0 else 0
+
+        wc1, wc2, wc3, wc4 = st.columns(4)
+        with wc1:
+            st.markdown(f'''<div class="metric-card">
+                <div class="metric-label">Flagged Trades</div>
+                <div class="metric-value">{len(wf_df)}</div>
+                <div class="metric-sub">all-time, backdated</div>
+            </div>''', unsafe_allow_html=True)
+        with wc2:
+            st.markdown(f'''<div class="metric-card">
+                <div class="metric-label">Win Rate</div>
+                <div class="metric-value">{wf_wr:.0f}%</div>
+                <div class="metric-sub">{wf_wins}W / {wf_losses}L, decided only</div>
+            </div>''', unsafe_allow_html=True)
+        with wc3:
+            st.markdown(f'''<div class="metric-card">
+                <div class="metric-label">Open</div>
+                <div class="metric-value">{wf_opens}</div>
+                <div class="metric-sub">still running</div>
+            </div>''', unsafe_allow_html=True)
+        with wc4:
+            latest_flag = wf_df["disclosure_date"].max() if len(wf_df) else None
+            st.markdown(f'''<div class="metric-card">
+                <div class="metric-label">Latest Flag</div>
+                <div class="metric-value" style="font-size:16px;padding-top:4px">{latest_flag or "N/A"}</div>
+                <div class="metric-sub">most recent disclosure</div>
+            </div>''', unsafe_allow_html=True)
+
+        # Tariff-window caveat (Liberation Day, April 2, 2025 — see README.md).
+        # Recomputed live off wf_df's trade_date rather than hardcoded, so it stays
+        # accurate as new trades get flagged.
+        if wf_decided > 0:
+            tariff_mask   = wf_df["trade_date"].notna() & (wf_df["trade_date"] >= "2025-03-01") & (wf_df["trade_date"] < "2025-05-01")
+            tariff_df     = wf_df[tariff_mask]
+            other_df      = wf_df[~tariff_mask]
+            tariff_decided = len(tariff_df[tariff_df["outcome"] != "open"])
+            other_decided  = len(other_df[other_df["outcome"] != "open"])
+            tariff_wr = (tariff_df["outcome"] == "win").sum() / tariff_decided * 100 if tariff_decided > 0 else 0
+            other_wr  = (other_df["outcome"]  == "win").sum() / other_decided  * 100 if other_decided  > 0 else 0
+            if tariff_decided > 0:
+                st.markdown(f"""
+                <div style="font-family:IBM Plex Mono,monospace;font-size:11px;color:#555;
+                            line-height:1.6;margin-bottom:16px;border-left:2px solid #333;
+                            padding-left:10px">
+                    {len(tariff_df)} of {len(wf_df)} flagged trades ({len(tariff_df)/len(wf_df)*100:.0f}%)
+                    fall in the Mar–Apr 2025 tariff-crash window (Liberation Day, April 2, 2025) —
+                    {tariff_wr:.0f}% WR there vs {other_wr:.0f}% WR on the rest. The blended win rate
+                    above is inflated by this single macro event, not a steady-state number.
+                </div>
+                """, unsafe_allow_html=True)
+
+        if wf_df.empty:
+            st.markdown('<div style="color:#444;font-family:IBM Plex Mono;font-size:12px">'
+                        'No trades currently meet the would-follow filter.</div>', unsafe_allow_html=True)
+        else:
+            def wf_fmt_size(v):
+                if pd.isna(v): return "—"
+                if v >= 1_000_000: return f"${v/1_000_000:.1f}M"
+                if v >= 1_000:     return f"${v/1_000:.0f}K"
+                return f"${v:.0f}"
+
+            wf_rows_html = ""
+            for _, row in wf_df.iterrows():
+                pty        = row.get("party", "") or ""
+                pty_short  = "R" if pty == "Republican" else "D" if pty == "Democrat" else "?"
+                pty_color  = "#ff5f5f" if pty == "Republican" else "#4a9eff"
+                ticker     = row.get("ticker") or "—"
+                company    = (row.get("company") or "—")[:24]
+                name       = (row.get("politician") or "—")[:16]
+                size_str   = wf_fmt_size(row.get("size_midpoint"))
+                entry      = row.get("entry_price")
+                entry_str  = f"${entry:.2f}" if pd.notna(entry) else "—"
+                disc_date  = row.get("disclosure_date", "") or ""
+                trade_date = row.get("trade_date", "") or "—"
+                cluster    = row.get("cluster_count_td")
+                cluster_str = f"{int(cluster)}" if pd.notna(cluster) else "—"
+                move       = row.get("abs_pct_move_before_disclosure")
+                move_str   = f"{move:.1f}%" if pd.notna(move) else "—"
+                dd         = row.get("max_drawdown_disc")
+                dd_str     = f"{dd:.1f}%" if pd.notna(dd) else "—"
+                outcome    = row.get("outcome", "open")
+                oc_color   = "#4caf50" if outcome == "win" else "#ff5252" if outcome == "loss" else "#888"
+
+                wf_rows_html += f"""<tr style="border-bottom:1px solid #111">
+                    <td style="padding:5px 10px;color:#666;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;white-space:nowrap">{disc_date}</td>
+                    <td style="padding:5px 10px;color:#666;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;white-space:nowrap">{trade_date}</td>
+                    <td style="padding:5px 10px;color:#e0e0e0;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;max-width:90px;overflow:hidden;
+                               text-overflow:ellipsis;white-space:nowrap">{name}</td>
+                    <td style="padding:5px 10px;color:{pty_color};font-family:IBM Plex Mono,monospace;
+                               font-size:11px">{pty_short}</td>
+                    <td style="padding:5px 10px;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;max-width:120px">
+                        <div style="color:#fff;font-weight:600">{company}</div>
+                        <div style="color:#666;font-size:10px;margin-top:1px">({ticker})</div>
+                    </td>
+                    <td style="padding:5px 10px;color:#ccc;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;white-space:nowrap">{size_str}</td>
+                    <td style="padding:5px 10px;color:#888;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;white-space:nowrap">{entry_str}</td>
+                    <td style="padding:5px 10px;color:#ccc;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;text-align:center">{cluster_str}</td>
+                    <td style="padding:5px 10px;color:#ccc;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;text-align:right">{move_str}</td>
+                    <td style="padding:5px 10px;color:#888;font-family:IBM Plex Mono,monospace;
+                               font-size:11px;text-align:right">{dd_str}</td>
+                    <td style="padding:5px 10px;font-family:IBM Plex Mono,monospace;
+                               font-size:12px;font-weight:600;color:{oc_color}">{outcome.upper()}</td>
+                </tr>"""
+
+            st.html(f"""
+            <div style="overflow-x:auto;border:1px solid #1a1a1a;border-radius:2px">
+            <table style="width:100%;border-collapse:collapse;background:#0a0a0a">
+                <thead>
+                    <tr style="border-bottom:2px solid #f5a623">
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f;white-space:nowrap">DISCLOSED</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f;white-space:nowrap">TRADE DATE</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">POLITICIAN</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">PTY</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">COMPANY</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">SIZE</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">ENTRY</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:center;background:#0f0f0f">CLUSTER</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:right;background:#0f0f0f">MOVE</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:right;background:#0f0f0f">MAX DD</th>
+                        <th style="padding:7px 10px;color:#f5a623;font-family:IBM Plex Mono,monospace;font-size:10px;letter-spacing:2px;text-align:left;background:#0f0f0f">OUTCOME</th>
+                    </tr>
+                </thead>
+                <tbody>{wf_rows_html}</tbody>
+            </table>
+            </div>
+            """)
 
     with tab1:
         st.markdown("<br>", unsafe_allow_html=True)
