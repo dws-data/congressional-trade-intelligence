@@ -240,7 +240,7 @@ def run(rebuild=False):
     print("  Market Features Builder")
     print("=" * 60)
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     create_table(conn)
 
     if rebuild:
@@ -269,7 +269,10 @@ def run(rebuild=False):
         rows.append(compute_row(disc_date, prices))
 
     # Reopen connection for write — keeps lock window minimal
-    conn = sqlite3.connect(DB_PATH)
+    # timeout=30: this step runs right after a heavy write burst (drawdown calc),
+    # and briefly commits into a ~3GB file — 5s default timeout wasn't enough
+    # margin for Windows to release its transient lock on the file.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     print(f"  Inserting {len(rows)} rows into market_features...")
     conn.executemany("""
         INSERT OR REPLACE INTO market_features
