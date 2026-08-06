@@ -17,7 +17,8 @@
 #   python runner/daily_runner.py --skip-scrape
 #   python runner/daily_runner.py --score-only
 #
-# Schedule with Windows Task Scheduler to run once daily after market close (e.g. 6pm)
+# Schedule with Windows Task Scheduler to run once daily at 9:30pm UK time —
+# after US market close (4pm ET), with a buffer for yfinance EOD data to settle.
 
 import sys
 import sqlite3
@@ -52,6 +53,112 @@ def log_section(title):
     log(bar)
     log(f"  {title}")
     log(bar)
+
+# ─────────────────────────────────────────────
+# HEALTH TRACKING (scrape sanity checks + weekly digest)
+# ─────────────────────────────────────────────
+# scrape_history: one row per step_scrape() call, used to detect N
+# consecutive zero-new-trade runs (possible scraper breakage) — kept
+# separate from run_history so --skip-scrape/--score-only runs don't
+# pollute the streak.
+# run_history: one row per full run() invocation (success or fail), used
+# to build the Sunday weekly digest. The digest exists specifically to
+# catch the case a warning-only alert can't: the scheduled task itself
+# stops firing entirely (disabled, machine off), so there's no error to
+# alert on — silence would otherwise look identical to "all fine".
+
+SCRAPE_ZERO_DAY_THRESHOLD = 5
+SCRAPE_HIGH_CEILING       = 500
+
+def ensure_health_tables():
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS scrape_history (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at     TEXT NOT NULL,
+            new_trades INTEGER NOT NULL
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS run_history (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at        TEXT NOT NULL,
+            mode          TEXT NOT NULL,
+            success       INTEGER NOT NULL,
+            new_trades    INTEGER,
+            duration_sec  REAL,
+            error_msg     TEXT
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+def _send_health_alert(subject, body):
+    from runner.notifier import send_email
+    sent = send_email(f"Congressional Trade Tracker — ALERT: {subject}", body)
+    log(f"Health alert email {'sent' if sent else 'NOT sent (see warning above)'}")
+
+def record_run(mode, success, new_trades=None, duration_sec=None, error_msg=None):
+    # timeout=30: this is called from the crash handler right after a fatal
+    # error — if that error was itself a DB lock, a bare 5s-default connect
+    # here would throw again, uncaught, and kill the alert path before it
+    # reaches the failure email. See 2026-08-05 diary for the incident this
+    # was found from.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    c    = conn.cursor()
+    c.execute("""
+        INSERT INTO run_history (run_at, mode, success, new_trades, duration_sec, error_msg)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), mode, int(success), new_trades, duration_sec, error_msg))
+    conn.commit()
+    conn.close()
+
+def maybe_send_weekly_digest():
+    """On Sunday's run, email a 7-day summary regardless of pass/fail — the
+    warning-only alerts above catch broken runs, this catches the run not
+    happening at all."""
+    if datetime.now().weekday() != 6:  # Monday=0 ... Sunday=6
+        return
+
+    conn = sqlite3.connect(DB_PATH)
+    c    = conn.cursor()
+    c.execute("""
+        SELECT run_at, mode, success, new_trades, duration_sec, error_msg
+        FROM run_history
+        WHERE run_at >= datetime('now', '-7 days')
+        ORDER BY run_at
+    """)
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        return
+
+    failures  = [r for r in rows if not r[2]]
+    total_new = sum(r[3] or 0 for r in rows)
+
+    lines = [
+        f"Weekly digest — {len(rows)} run(s) in the last 7 days, "
+        f"{len(failures)} failure(s), {total_new:,} new trades total.",
+        "",
+    ]
+    for run_at, mode, success, new_trades, duration_sec, error_msg in rows:
+        status = "OK" if success else "FAILED"
+        dur    = f"{duration_sec:.0f}s" if duration_sec else "?"
+        nt     = new_trades if new_trades is not None else "?"
+        line   = f"  {run_at}  [{status}]  mode={mode}  new_trades={nt}  duration={dur}"
+        if error_msg:
+            line += f"\n    error: {error_msg}"
+        lines.append(line)
+
+    subject = (f"Congressional Trade Tracker — Weekly digest ({len(failures)} failure(s))"
+               if failures else
+               "Congressional Trade Tracker — Weekly digest (all runs OK)")
+
+    from runner.notifier import send_email
+    sent = send_email(subject, "\n".join(lines))
+    log(f"Weekly digest email {'sent' if sent else 'NOT sent (see warning above)'}")
 
 # ─────────────────────────────────────────────
 # DB HELPERS
@@ -105,6 +212,36 @@ def step_scrape():
         new_trades = after_total - before_total
         log(f"Trades after scrape:  {after_total:,}  (+{new_trades} new)")
         log(f"Latest disclosure:    {latest}")
+
+        conn = sqlite3.connect(DB_PATH)
+        c    = conn.cursor()
+        c.execute("INSERT INTO scrape_history (run_at, new_trades) VALUES (?, ?)",
+                   (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), new_trades))
+        conn.commit()
+        c.execute("SELECT new_trades FROM scrape_history ORDER BY id DESC LIMIT ?",
+                   (SCRAPE_ZERO_DAY_THRESHOLD,))
+        recent = [row[0] for row in c.fetchall()]
+        conn.close()
+
+        if new_trades > SCRAPE_HIGH_CEILING:
+            log(f"WARNING: scrape returned {new_trades} new trades — above the "
+                f"{SCRAPE_HIGH_CEILING} sanity ceiling")
+            _send_health_alert(
+                f"scrape returned unusually high count ({new_trades})",
+                f"step_scrape() saw +{new_trades} new trades this run, above the "
+                f"{SCRAPE_HIGH_CEILING} sanity ceiling. Could indicate a duplicate-insert "
+                f"or DB wipe bug. Check logs/daily_run.log."
+            )
+        elif len(recent) == SCRAPE_ZERO_DAY_THRESHOLD and all(n == 0 for n in recent):
+            log(f"WARNING: {SCRAPE_ZERO_DAY_THRESHOLD} consecutive scrapes with 0 new trades")
+            _send_health_alert(
+                f"{SCRAPE_ZERO_DAY_THRESHOLD} consecutive scrapes with 0 new trades",
+                f"The last {SCRAPE_ZERO_DAY_THRESHOLD} daily runs have all returned 0 new "
+                f"trades from Capitol Trades. Zero on a single day is normal (weekends/slow "
+                f"news), but not {SCRAPE_ZERO_DAY_THRESHOLD} in a row — check for site layout "
+                f"changes, CAPTCHAs, or driver issues. See logs/daily_run.log."
+            )
+
         return new_trades
 
     except Exception as e:
@@ -433,6 +570,7 @@ def step_score():
 # ─────────────────────────────────────────────
 
 def run(skip_scrape=False, score_only=False):
+    ensure_health_tables()
     start = datetime.now()
 
     log("")
@@ -485,6 +623,10 @@ def run(skip_scrape=False, score_only=False):
     log(f"Total trades:      {total_after:,}  (was {total_before:,})")
     log("")
 
+    mode = "score-only" if score_only else ("skip-scrape" if skip_scrape else "full")
+    record_run(mode, success=True, new_trades=new_trades, duration_sec=elapsed)
+    maybe_send_weekly_digest()
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Congressional Trade Tracker — Daily Runner")
@@ -494,10 +636,42 @@ if __name__ == "__main__":
                         help="Run scorer only (fastest, use after manual DB changes)")
     args = parser.parse_args()
 
+    ensure_health_tables()
+    run_start = datetime.now()
+    mode = "score-only" if args.score_only else ("skip-scrape" if args.skip_scrape else "full")
+
     try:
         run(skip_scrape=args.skip_scrape, score_only=args.score_only)
     except Exception as e:
         log(f"FATAL ERROR: {e}")
         import traceback
-        log(traceback.format_exc())
+        tb = traceback.format_exc()
+        log(tb)
+
+        duration = (datetime.now() - run_start).total_seconds()
+
+        # Email first: it's the actual point of this handler and doesn't touch
+        # trades.db, so it can't be defeated by whatever just crashed the run
+        # (including a DB lock). record_run() is wrapped separately below —
+        # on 2026-08-04 21:45 an unguarded record_run() call here threw its own
+        # "database is locked" (same lock that caused the fatal error in the
+        # first place), which went uncaught and killed the process before the
+        # email ever sent. Neither failure mode should be able to silence the
+        # other.
+        try:
+            from runner.notifier import send_email
+            sent = send_email(
+                "Congressional Trade Tracker — ALERT: daily run FAILED",
+                f"The daily runner crashed with a fatal error:\n\n{e}\n\n{tb}\n\n"
+                f"See logs/daily_run.log for full context."
+            )
+            log(f"Failure alert email {'sent' if sent else 'NOT sent (see warning above)'}")
+        except Exception as email_err:
+            log(f"WARNING: failed to send failure alert email: {email_err}")
+
+        try:
+            record_run(mode, success=False, duration_sec=duration, error_msg=str(e))
+        except Exception as record_err:
+            log(f"WARNING: failed to record failed run to run_history: {record_err}")
+
         sys.exit(1)

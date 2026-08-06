@@ -16,6 +16,14 @@
 # and controls whether a disc-date path exists. A missing trade-date price
 # is not a fatal error for the pipeline; it just leaves pct_move as NULL.
 #
+# Skip-tracking: tickers that fail to return yfinance history are recorded
+# in ticker_fetch_failures (owned exclusively by this module). A ticker is
+# only permanently skipped after MAX_CONSECUTIVE_FAILS consecutive failed
+# runs — a single bad night (Yahoo backend hiccup) doesn't blacklist a live
+# ticker, but a ticker that is genuinely dead (bond CUSIP, crypto pair,
+# malformed symbol, real delisting) stops being retried every night after
+# a few confirmed misses. Any success resets the counter to 0.
+#
 # Usage:
 #   python -m pipeline.trade_date_prices          # process all missing
 #   python -m pipeline.trade_date_prices --dry-run
@@ -32,6 +40,56 @@ DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
 DELAY      = 0.4
 COMMIT_N   = 50
 TIMEOUT    = 10
+MAX_CONSECUTIVE_FAILS = 3   # consecutive failed runs before a ticker is permanently skipped
+
+
+def _ensure_failure_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS ticker_fetch_failures (
+            ticker              TEXT PRIMARY KEY,
+            consecutive_fails   INTEGER NOT NULL DEFAULT 0,
+            last_attempt        TEXT,
+            permanently_skipped INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
+
+
+def _load_skipped_tickers(conn):
+    rows = conn.execute(
+        "SELECT ticker FROM ticker_fetch_failures WHERE permanently_skipped = 1"
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _record_failure(conn, ticker, today_str):
+    # Guard against same-day re-runs (manual re-trigger, debugging) double-counting
+    # a single day's failure as multiple consecutive ones — only the first failure
+    # seen for a given calendar date increments the streak.
+    conn.execute("""
+        INSERT INTO ticker_fetch_failures (ticker, consecutive_fails, last_attempt, permanently_skipped)
+        VALUES (?, 1, ?, 0)
+        ON CONFLICT(ticker) DO UPDATE SET
+            consecutive_fails   = CASE WHEN last_attempt = excluded.last_attempt
+                                       THEN consecutive_fails
+                                       ELSE consecutive_fails + 1 END,
+            permanently_skipped = CASE WHEN last_attempt = excluded.last_attempt
+                                       THEN permanently_skipped
+                                       WHEN consecutive_fails + 1 >= ?
+                                       THEN 1 ELSE permanently_skipped END,
+            last_attempt        = excluded.last_attempt
+    """, (ticker, today_str, MAX_CONSECUTIVE_FAILS))
+
+
+def _record_success(conn, ticker, today_str):
+    conn.execute("""
+        INSERT INTO ticker_fetch_failures (ticker, consecutive_fails, last_attempt, permanently_skipped)
+        VALUES (?, 0, ?, 0)
+        ON CONFLICT(ticker) DO UPDATE SET
+            consecutive_fails   = 0,
+            last_attempt        = excluded.last_attempt,
+            permanently_skipped = 0
+    """, (ticker, today_str))
 
 
 def _fetch_history(ticker, start_date_str, end_date_str):
@@ -63,6 +121,8 @@ def run(db_path=None, dry_run=False):
     db   = str(db_path if db_path else DB_PATH)
     conn = sqlite3.connect(db)
     c    = conn.cursor()
+    _ensure_failure_table(conn)
+    today_str = str(date.today())
 
     print("=" * 60)
     print("  Trade Date Prices")
@@ -89,12 +149,23 @@ def run(db_path=None, dry_run=False):
         conn.close()
         return 0, 0
 
-    # Group by ticker
+    # Group by ticker, then drop tickers already confirmed permanently dead
+    # (MAX_CONSECUTIVE_FAILS consecutive misses) so we stop wasting API calls
+    # and runtime on them every night.
     by_ticker = defaultdict(list)
     for trade_id, ticker, trade_date, disc_price in rows:
         by_ticker[ticker].append((trade_id, trade_date, disc_price))
 
-    print(f"Distinct tickers: {len(by_ticker):,}\n")
+    skipped_tickers = _load_skipped_tickers(conn)
+    already_skipped = [t for t in by_ticker if t in skipped_tickers]
+    for t in already_skipped:
+        del by_ticker[t]
+
+    print(f"Distinct tickers: {len(by_ticker) + len(already_skipped):,}")
+    if already_skipped:
+        print(f"Permanently skipped ({MAX_CONSECUTIVE_FAILS}+ consecutive fails, not retried): "
+              f"{len(already_skipped):,}")
+    print()
 
     price_updated = 0
     pct_updated   = 0
@@ -114,9 +185,14 @@ def run(db_path=None, dry_run=False):
         hist = _fetch_history(ticker, start, end)
         if hist is None:
             no_data.append(ticker)
+            if not dry_run:
+                _record_failure(conn, ticker, today_str)
             processed += 1
             time.sleep(DELAY)
             continue
+
+        if not dry_run:
+            _record_success(conn, ticker, today_str)
 
         for trade_id, trade_date, disc_price in trades:
             trade_price = _get_price_on_or_before(hist, trade_date)
