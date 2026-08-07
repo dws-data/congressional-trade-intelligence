@@ -21,7 +21,6 @@
 # after US market close (4pm ET), with a buffer for yfinance EOD data to settle.
 
 import sys
-import sqlite3
 import argparse
 from datetime import datetime
 from pathlib import Path
@@ -29,6 +28,8 @@ from pathlib import Path
 # Project root = congressional_trading/ (one level up from runner/)
 ROOT     = Path(__file__).parent.parent
 sys.path.insert(0, str(ROOT))
+
+from db import get_connection
 
 DB_PATH  = str(ROOT / "data" / "trades.db")
 LOG_DIR  = ROOT / "logs"
@@ -71,7 +72,7 @@ SCRAPE_ZERO_DAY_THRESHOLD = 5
 SCRAPE_HIGH_CEILING       = 500
 
 def ensure_health_tables():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c    = conn.cursor()
     c.execute("""
         CREATE TABLE IF NOT EXISTS scrape_history (
@@ -100,12 +101,12 @@ def _send_health_alert(subject, body):
     log(f"Health alert email {'sent' if sent else 'NOT sent (see warning above)'}")
 
 def record_run(mode, success, new_trades=None, duration_sec=None, error_msg=None):
-    # timeout=30: this is called from the crash handler right after a fatal
-    # error — if that error was itself a DB lock, a bare 5s-default connect
-    # here would throw again, uncaught, and kill the alert path before it
-    # reaches the failure email. See 2026-08-05 diary for the incident this
-    # was found from.
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    # get_connection()'s 30s default timeout matters here specifically: this is
+    # called from the crash handler right after a fatal error — if that error
+    # was itself a DB lock, SQLite's old 5s default would throw again, uncaught,
+    # and kill the alert path before it reaches the failure email. See 2026-08-05
+    # diary for the incident this was found from.
+    conn = get_connection()
     c    = conn.cursor()
     c.execute("""
         INSERT INTO run_history (run_at, mode, success, new_trades, duration_sec, error_msg)
@@ -121,7 +122,7 @@ def maybe_send_weekly_digest():
     if datetime.now().weekday() != 6:  # Monday=0 ... Sunday=6
         return
 
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c    = conn.cursor()
     c.execute("""
         SELECT run_at, mode, success, new_trades, duration_sec, error_msg
@@ -165,7 +166,7 @@ def maybe_send_weekly_digest():
 # ─────────────────────────────────────────────
 
 def get_trade_counts():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c    = conn.cursor()
     c.execute("SELECT COUNT(*) FROM trades")
     total = c.fetchone()[0]
@@ -180,7 +181,7 @@ def get_trade_counts():
 
 def get_new_trades_since(last_run_date):
     """Count trades added since last run date."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c    = conn.cursor()
     c.execute("""
         SELECT COUNT(*) FROM trades
@@ -213,7 +214,7 @@ def step_scrape():
         log(f"Trades after scrape:  {after_total:,}  (+{new_trades} new)")
         log(f"Latest disclosure:    {latest}")
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("INSERT INTO scrape_history (run_at, new_trades) VALUES (?, ?)",
                    (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), new_trades))
@@ -288,7 +289,7 @@ def step_trade_date_prices():
     try:
         from pipeline.trade_date_prices import run as run_trade_date_prices
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("""
             SELECT COUNT(*) FROM trades
@@ -322,7 +323,7 @@ def step_classify_assets():
     try:
         from pipeline.asset_type_fetcher import fetch_asset_types
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("""
             SELECT COUNT(DISTINCT ticker) FROM trades
@@ -357,7 +358,7 @@ def step_drawdown():
         from pipeline.drawdown_calculator import run_drawdown_calculator
 
         # Count trades missing drawdown before
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("""
             SELECT COUNT(*) FROM trades
@@ -374,7 +375,7 @@ def step_drawdown():
         # Skipping when missing==0 would leave stale disc-close-based values in place.
         run_drawdown_calculator()
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("""
             SELECT COUNT(*) FROM trades
@@ -402,7 +403,7 @@ def step_market_features():
     try:
         from pipeline.market_features import run as run_market_features
 
-        conn   = sqlite3.connect(DB_PATH)
+        conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM market_features") if cursor.execute(
             "SELECT name FROM sqlite_master WHERE type='table' AND name='market_features'"
@@ -411,7 +412,7 @@ def step_market_features():
 
         run_market_features(rebuild=False)
 
-        conn   = sqlite3.connect(DB_PATH)
+        conn   = get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT COUNT(*) FROM market_features")
         total = cursor.fetchone()[0]
@@ -428,7 +429,7 @@ def step_sector_and_committee():
     try:
         from pipeline.sector_fetcher import fetch_ticker_data, flag_committee_relevance
 
-        conn   = sqlite3.connect(DB_PATH)
+        conn   = get_connection()
         cursor = conn.cursor()
 
         cursor.execute("""
@@ -536,7 +537,7 @@ def step_score():
     try:
         from pipeline.scorer import run_scorer
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("SELECT COUNT(*) FROM politicians WHERE score IS NOT NULL")
         scored_before = c.fetchone()[0]
@@ -546,7 +547,7 @@ def step_score():
 
         scored_list = run_scorer()
 
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_connection()
         c    = conn.cursor()
         c.execute("SELECT COUNT(*) FROM politicians WHERE score IS NOT NULL")
         scored_after = c.fetchone()[0]

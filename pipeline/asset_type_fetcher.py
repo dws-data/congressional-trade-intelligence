@@ -15,12 +15,14 @@
 #
 # Run: python -m pipeline.asset_type_fetcher
 
-import sqlite3
+import sys
 import time
 import yfinance as yf
 from pathlib import Path
 
-DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
+
 DELAY      = 0.1    # seconds between yfinance calls — be polite
 BATCH_SIZE = 50     # commit every N tickers
 INVALID_TICKERS = {"--", "N/A", "NA", ""}
@@ -101,8 +103,7 @@ def run_asset_type_fetcher(db_path=None):
     print("  Source: yfinance quoteType")
     print("=" * 60)
 
-    db     = db_path if db_path else DB_PATH
-    conn   = sqlite3.connect(db)
+    conn   = get_connection(db_path)
     cursor = conn.cursor()
 
     # Ensure column exists

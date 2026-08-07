@@ -20,18 +20,19 @@
 # Sets repeat_before_close = 0 for all trades first, then flags the repeats.
 # Run after price_fetcher and drawdown_calculator (requires close_date_disc).
 
-import sqlite3
+import sys
 from collections import defaultdict
 from datetime import datetime, timedelta
+from pathlib import Path
 
-DB_PATH = "data/trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 WINDOW_DAYS = 180  # maximum scoring window; used to cap open positions
 
 
 def run_repeat_buy_flagger(db_path=None):
-    db     = db_path if db_path else DB_PATH
-    conn   = sqlite3.connect(db)
+    conn   = get_connection(db_path)
     cursor = conn.cursor()
 
     print("=" * 60)

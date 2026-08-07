@@ -25,20 +25,20 @@
 #   python -m pipeline.cluster_count
 #   python -m pipeline.cluster_count --db data/trades.db
 
-import sqlite3
+import sys
 import argparse
 from pathlib import Path
 from datetime import datetime, timedelta
 from collections import defaultdict
 
-DB_PATH = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 WINDOW_DAYS = 30  # calendar days for both cluster windows
 
 
 def run_cluster_count(db_path=None):
-    db   = str(db_path) if db_path else str(DB_PATH)
-    conn = sqlite3.connect(db)
+    conn = get_connection(db_path)
     c    = conn.cursor()
 
     print("=" * 60)

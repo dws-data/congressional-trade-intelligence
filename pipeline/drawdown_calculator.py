@@ -9,10 +9,13 @@
 #
 # Overwrites all existing drawdown columns in trades table
 
-import sqlite3
+import sys
 from collections import defaultdict
+from pathlib import Path
 
-DB_PATH    = "data/trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
+
 BATCH_SIZE = 100
 STOP_PCT   = 10.0
 TARGET_PCT = 10.0
@@ -101,8 +104,7 @@ def run_drawdown_calculator(db_path=None):
     using intraday OHLC from trade_price_paths.
     Overwrites existing values.
     """
-    db     = db_path if db_path else DB_PATH
-    conn   = sqlite3.connect(db)
+    conn   = get_connection(db_path)
     cursor = conn.cursor()
 
     print("=" * 60)

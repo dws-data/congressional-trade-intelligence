@@ -24,7 +24,7 @@
 #   python -m pipeline.market_features           # fill missing dates only
 #   python -m pipeline.market_features --rebuild # wipe and rebuild all
 
-import sqlite3
+import sys
 import argparse
 import time
 from datetime import date, timedelta, datetime
@@ -33,7 +33,8 @@ from pathlib import Path
 import pandas as pd
 import yfinance as yf
 
-DB_PATH = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 TICKERS = ["SPY", "^VIX", "XLK", "XLV", "XLF", "XLE", "XLY", "XLP", "XLI", "XLB", "XLRE", "XLU", "XLC"]
 
@@ -240,7 +241,7 @@ def run(rebuild=False):
     print("  Market Features Builder")
     print("=" * 60)
 
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = get_connection()
     create_table(conn)
 
     if rebuild:
@@ -272,7 +273,7 @@ def run(rebuild=False):
     # timeout=30: this step runs right after a heavy write burst (drawdown calc),
     # and briefly commits into a ~3GB file — 5s default timeout wasn't enough
     # margin for Windows to release its transient lock on the file.
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = get_connection()
     print(f"  Inserting {len(rows)} rows into market_features...")
     conn.executemany("""
         INSERT OR REPLACE INTO market_features

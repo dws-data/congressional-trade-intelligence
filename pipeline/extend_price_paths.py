@@ -21,7 +21,7 @@
 #   python -m pipeline.extend_price_paths
 #   python -m pipeline.extend_price_paths --db data/fmp_staging.db
 
-import sqlite3
+import sys
 import yfinance as yf
 import time
 import argparse
@@ -29,7 +29,9 @@ from datetime import datetime, timedelta, date
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
+
 DELAY      = 0.4
 COMMIT_N   = 50
 TIMEOUT    = 10
@@ -79,8 +81,8 @@ def build_new_paths(db_path=None):
 
     Grouped by ticker to minimise yfinance API calls.
     """
-    db   = str(db_path if db_path else DB_PATH)
-    conn = sqlite3.connect(db)
+    db   = str(db_path) if db_path else "trades.db"
+    conn = get_connection(db_path)
     c    = conn.cursor()
     today = str(date.today())
 
@@ -205,8 +207,8 @@ def extend_open_paths(db_path=None):
     last stored path date is before today.
     Grouped by ticker to minimise yfinance API calls.
     """
-    db    = str(db_path if db_path else DB_PATH)
-    conn  = sqlite3.connect(db)
+    db    = str(db_path) if db_path else "trades.db"
+    conn  = get_connection(db_path)
     c     = conn.cursor()
     today = date.today()
 

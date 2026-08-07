@@ -28,7 +28,7 @@
 #   python -m pipeline.trade_date_prices          # process all missing
 #   python -m pipeline.trade_date_prices --dry-run
 
-import sqlite3
+import sys
 import yfinance as yf
 import time
 import argparse
@@ -36,7 +36,9 @@ from datetime import datetime, timedelta, date
 from collections import defaultdict
 from pathlib import Path
 
-DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
+
 DELAY      = 0.4
 COMMIT_N   = 50
 TIMEOUT    = 10
@@ -118,8 +120,8 @@ def _get_price_on_or_before(hist, target_date_str):
 
 
 def run(db_path=None, dry_run=False):
-    db   = str(db_path if db_path else DB_PATH)
-    conn = sqlite3.connect(db)
+    db   = str(db_path) if db_path else "trades.db"
+    conn = get_connection(db_path)
     c    = conn.cursor()
     _ensure_failure_table(conn)
     today_str = str(date.today())

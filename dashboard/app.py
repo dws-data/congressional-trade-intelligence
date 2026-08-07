@@ -7,11 +7,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import streamlit as st
-import sqlite3
 import pandas as pd
 from collections import defaultdict
 from datetime import date, timedelta, datetime
 from pipeline.committee_config import COMMITTEE_NAMES
+from db import get_connection
 
 # ─────────────────────────────────────────────
 # COMMITTEE CONFIDENCE TIERS
@@ -48,7 +48,6 @@ def _comm_tier(committee_relevance_str):
 # CONFIG
 # ─────────────────────────────────────────────
 
-DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
 STOP_PCT   = 10.0
 TARGET_PCT = 10.0
 
@@ -164,7 +163,7 @@ hr { border-color: #1a1a1a; }
 
 @st.cache_data(ttl=3600, persist="disk")
 def load_leaderboard():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     df = pd.read_sql_query("""
         SELECT politician_id, name, party, chamber, state,
                score,
@@ -205,7 +204,7 @@ def load_summary_stats():
 
     Verified ground truth: Overall 56.6%, R 57.9%, D 56.0%
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     c    = conn.cursor()
 
     c.execute("SELECT COUNT(*) FROM politicians WHERE score IS NOT NULL")
@@ -278,7 +277,7 @@ def load_summary_stats():
 
 @st.cache_data(ttl=300)
 def load_politician_profile(pol_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
 
     # Basic info
     pol = pd.read_sql_query("""
@@ -433,7 +432,7 @@ def load_combo_stats(stop_pct, target_pct, min_size=0):
     from the trades table — no path data needed, instant.
     Custom combos: full re-simulation from trade_price_paths.
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
 
     if stop_pct == 10 and target_pct == 10:
         # ── Fast path: read pre-computed outcomes from trades table ──
@@ -476,7 +475,7 @@ def load_combo_stats(stop_pct, target_pct, min_size=0):
         conn.close()
         return df
 
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
 
     # Fetch deduplicated compliant buys with path data
     size_clause = f"AND MAX(size_midpoint) >= {min_size}" if min_size > 0 else ""
@@ -582,7 +581,7 @@ def load_combo_stats(stop_pct, target_pct, min_size=0):
 
 @st.cache_data(ttl=300)
 def load_feed(days_back=7):
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cutoff = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     df = pd.read_sql_query(f"""
         SELECT
@@ -647,7 +646,7 @@ def load_feed(days_back=7):
 
 @st.cache_data(ttl=300)
 def load_feed_stats(days_back=7):
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cutoff = (date.today() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     cursor = conn.cursor()
     cursor.execute(f"""
@@ -686,7 +685,7 @@ def load_would_follow():
       win:  max_drawdown_disc > -10  AND days_to_exit_disc IS NOT NULL
       open: max_drawdown_disc IS NULL OR days_to_exit_disc IS NULL (still running)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     df = pd.read_sql_query("""
         SELECT
             t.trade_id,
@@ -728,7 +727,7 @@ def load_pipeline_funnel():
     Basket/repeat/dedup steps use CTEs + LEFT JOIN instead of correlated NOT EXISTS
     subqueries — dramatically faster on SQLite (single pass vs O(n²)).
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     cur  = conn.cursor()
 
     def q(sql): return cur.execute(sql).fetchone()[0]
@@ -873,7 +872,7 @@ def load_pipeline_funnel():
 @st.cache_data(persist="disk")
 def load_freshness_stats():
     """Latest filing date and latest price path date — used in sidebar status block."""
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT MAX(disclosure_date) FROM trades WHERE disclosure_date != ''")
     latest_filing = cursor.fetchone()[0]
@@ -893,7 +892,7 @@ def load_committee_stats():
       WIN:  max_drawdown_disc > -10   AND days_to_exit_disc IS NOT NULL  (target hit)
       OPEN: max_drawdown_disc > -10   AND days_to_exit_disc IS NULL      (still running)
     """
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_connection()
     trades_df = pd.read_sql_query("""
         SELECT committee_relevance, max_drawdown_disc, days_to_exit_disc
         FROM trades

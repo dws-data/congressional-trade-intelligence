@@ -4,16 +4,19 @@
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
-import sqlite3
+import sys
 import time
 import re
+from pathlib import Path
 from datetime import datetime, timedelta
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 # ─────────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-DB_PATH    = "data/trades.db"
 BASE_URL   = "https://www.capitoltrades.com/trades?page={}"
 PAGE_DELAY = 4
 NEXT_DELAY = 2
@@ -302,7 +305,7 @@ def run_scraper(max_pages=None, start_page=1, headless=True):
         headless:   False = show Chrome window (debug mode)
     """
     # Clear existing data if starting fresh
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cursor = conn.cursor()
 
     if start_page == 1 and max_pages is None:
@@ -383,7 +386,7 @@ def run_scraper(max_pages=None, start_page=1, headless=True):
         driver.quit()
         conn.close()
 
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cursor = conn.cursor()
     cursor.execute("SELECT COUNT(*) FROM trades")
     db_trades = cursor.fetchone()[0]

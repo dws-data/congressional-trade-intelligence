@@ -7,9 +7,13 @@
 # Minimum threshold: 10 completed compliant buy trades
 # Score range: 0-100
 
-import sqlite3
+import sys
 import math
 from datetime import datetime, timedelta
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 # ─────────────────────────────────────────────
 # SCORING FILTERS — WHY EACH EXISTS
@@ -57,7 +61,6 @@ from datetime import datetime, timedelta
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-DB_PATH           = "data/trades.db"
 STOP_PCT          = 10.0
 TARGET_PCT        = 10.0
 MIN_TRADES        = 5       # minimum compliant buy trades to get a score
@@ -315,7 +318,7 @@ def fetch_trades_by_pol(cursor, asset_filter_sql):
 def run_scorer():
     from collections import defaultdict
 
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cursor = conn.cursor()
 
     print("=" * 60)

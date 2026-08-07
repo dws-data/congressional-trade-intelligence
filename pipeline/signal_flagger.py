@@ -19,11 +19,12 @@
 # Usage:
 #   python -m pipeline.signal_flagger
 
-import sqlite3
+import sys
 from datetime import datetime
 from pathlib import Path
 
-DB_PATH = Path(__file__).parent.parent / "data" / "trades.db"
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
 
 CLUSTER_MIN  = 2
 ABS_MOVE_MIN = 15
@@ -45,9 +46,8 @@ def ensure_schema(conn):
 def mark_notified(trade_ids, db_path=None):
     if not trade_ids:
         return
-    db  = db_path or DB_PATH
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    conn = sqlite3.connect(db, timeout=30)
+    conn = get_connection(db_path)
     conn.executemany(
         "INSERT OR IGNORE INTO signal_notifications (trade_id, notified_at) VALUES (?, ?)",
         [(tid, now) for tid in trade_ids]
@@ -65,8 +65,7 @@ def run_signal_flagger(db_path=None):
     signal_notifications. Caller is responsible for calling mark_notified()
     once it has actually surfaced/emailed them.
     """
-    db   = db_path or DB_PATH
-    conn = sqlite3.connect(db, timeout=30)
+    conn = get_connection(db_path)
     ensure_schema(conn)
     cursor = conn.cursor()
 
@@ -93,7 +92,7 @@ def run_signal_flagger(db_path=None):
         cursor.execute("SELECT trade_id FROM trades WHERE signal_flag = 1")
         existing_ids = [r[0] for r in cursor.fetchall()]
         conn.close()
-        mark_notified(existing_ids, db_path=db)
+        mark_notified(existing_ids, db_path=db_path)
         return total_flagged, []
 
     cursor.execute("""

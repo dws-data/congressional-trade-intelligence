@@ -13,18 +13,20 @@
 #
 # Run: python pipeline/sector_fetcher.py
 
-import sqlite3
+import sys
 import yfinance as yf
 import time
 from datetime import date
 from pathlib import Path
 from collections import defaultdict
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from db import get_connection
+
 # ─────────────────────────────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────────────────────────────
 
-DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
 DELAY      = 0.3   # seconds between yfinance calls
 BATCH_SIZE = 100   # commit every N updates
 
@@ -303,7 +305,7 @@ def run_sector_fetcher():
     print("  Sector Fetcher & Committee Relevance Fixer")
     print("=" * 60)
 
-    conn   = sqlite3.connect(DB_PATH)
+    conn   = get_connection()
     cursor = conn.cursor()
 
     print("\n  Step 1: Ensuring columns exist...")
