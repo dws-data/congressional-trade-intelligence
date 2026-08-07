@@ -3,11 +3,20 @@
 # Stores in trades.sector column
 # Then re-runs committee_relevance flagging with proper sector matching
 #
+# Skip-tracking: tickers that never get industry data back from yfinance
+# (delistings, bond CUSIPs, malformed symbols) are recorded in
+# sector_fetch_failures (owned exclusively by this module, same pattern as
+# trade_date_prices.py's ticker_fetch_failures). A ticker is only
+# permanently skipped after MAX_CONSECUTIVE_FAILS consecutive failed runs,
+# so a single bad night doesn't blacklist a live ticker. Any success resets
+# the counter to 0.
+#
 # Run: python pipeline/sector_fetcher.py
 
 import sqlite3
 import yfinance as yf
 import time
+from datetime import date
 from pathlib import Path
 from collections import defaultdict
 
@@ -19,6 +28,16 @@ DB_PATH    = Path(__file__).parent.parent / "data" / "trades.db"
 DELAY      = 0.3   # seconds between yfinance calls
 BATCH_SIZE = 100   # commit every N updates
 
+# Skip-tracking: mirrors pipeline/trade_date_prices.py's ticker_fetch_failures.
+# A ticker with no industry data is retried via yf.Ticker().info every night
+# forever unless something remembers it failed before — most of these are
+# permanently dead (delistings, bond CUSIPs, malformed symbols) and this was
+# the single biggest chunk of nightly runtime (2026-08-05 timing breakdown:
+# 7m09s / 28% fetching ~930 such tickers). Same 3-consecutive-day threshold
+# and same-day guard as trade_date_prices.py, kept in its own table since
+# each module owns its own failure history.
+MAX_CONSECUTIVE_FAILS = 3
+
 # ─────────────────────────────────────────────────────────────────
 # COMMITTEE -> SECTORS MAPPING
 # ─────────────────────────────────────────────────────────────────
@@ -26,6 +45,57 @@ BATCH_SIZE = 100   # commit every N updates
 from pipeline.committee_config import (
     COMMITTEE_SUBSECTOR_MAP, COMMITTEE_NAMES, get_subsector,
 )
+
+# ─────────────────────────────────────────────────────────────────
+# SKIP-TRACKING (sector_fetch_failures)
+# ─────────────────────────────────────────────────────────────────
+
+def _ensure_failure_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sector_fetch_failures (
+            ticker              TEXT PRIMARY KEY,
+            consecutive_fails   INTEGER NOT NULL DEFAULT 0,
+            last_attempt        TEXT,
+            permanently_skipped INTEGER NOT NULL DEFAULT 0
+        )
+    """)
+    conn.commit()
+
+
+def _load_skipped_tickers(conn):
+    rows = conn.execute(
+        "SELECT ticker FROM sector_fetch_failures WHERE permanently_skipped = 1"
+    ).fetchall()
+    return {r[0] for r in rows}
+
+
+def _record_failure(conn, ticker, today_str):
+    # Same-day guard: a manual re-trigger on the same calendar date shouldn't
+    # inflate the streak.
+    conn.execute("""
+        INSERT INTO sector_fetch_failures (ticker, consecutive_fails, last_attempt, permanently_skipped)
+        VALUES (?, 1, ?, 0)
+        ON CONFLICT(ticker) DO UPDATE SET
+            consecutive_fails   = CASE WHEN last_attempt = excluded.last_attempt
+                                       THEN consecutive_fails
+                                       ELSE consecutive_fails + 1 END,
+            permanently_skipped = CASE WHEN last_attempt = excluded.last_attempt
+                                       THEN permanently_skipped
+                                       WHEN consecutive_fails + 1 >= ?
+                                       THEN 1 ELSE permanently_skipped END,
+            last_attempt        = excluded.last_attempt
+    """, (ticker, today_str, MAX_CONSECUTIVE_FAILS))
+
+
+def _record_success(conn, ticker, today_str):
+    conn.execute("""
+        INSERT INTO sector_fetch_failures (ticker, consecutive_fails, last_attempt, permanently_skipped)
+        VALUES (?, 0, ?, 0)
+        ON CONFLICT(ticker) DO UPDATE SET
+            consecutive_fails   = 0,
+            last_attempt        = excluded.last_attempt,
+            permanently_skipped = 0
+    """, (ticker, today_str))
 
 # ─────────────────────────────────────────────────────────────────
 # STEP 1: ENSURE COLUMNS EXIST
@@ -49,6 +119,9 @@ def ensure_columns(cursor):
 # ─────────────────────────────────────────────────────────────────
 
 def fetch_ticker_data(conn, cursor):
+    _ensure_failure_table(conn)
+    today_str = str(date.today())
+
     # Fetch tickers missing industry data (includes those with sector but no industry)
     cursor.execute("""
         SELECT DISTINCT ticker FROM trades
@@ -59,7 +132,19 @@ def fetch_ticker_data(conn, cursor):
         ORDER BY ticker
     """)
     tickers = [r[0] for r in cursor.fetchall()]
-    print(f"  Tickers to fetch: {len(tickers):,}")
+
+    # Drop tickers already confirmed permanently dead (MAX_CONSECUTIVE_FAILS
+    # consecutive misses) so we stop burning yf.Ticker().info calls on them
+    # every night — see sector_fetch_failures.
+    skipped_tickers = _load_skipped_tickers(conn)
+    already_skipped = [t for t in tickers if t in skipped_tickers]
+    if already_skipped:
+        tickers = [t for t in tickers if t not in skipped_tickers]
+
+    print(f"  Tickers to fetch: {len(tickers) + len(already_skipped):,}")
+    if already_skipped:
+        print(f"  Permanently skipped ({MAX_CONSECUTIVE_FAILS}+ consecutive fails, not retried): "
+              f"{len(already_skipped):,}")
 
     ticker_data = {}
     failed      = 0
@@ -85,15 +170,19 @@ def fetch_ticker_data(conn, cursor):
             ticker_data[ticker] = (sector, industry)
             if industry:
                 succeeded += 1
+                _record_success(conn, ticker, today_str)
             else:
                 failed += 1
+                _record_failure(conn, ticker, today_str)
         except Exception:
             ticker_data[ticker] = (None, None)
             failed += 1
+            _record_failure(conn, ticker, today_str)
 
         time.sleep(DELAY)
 
         if (i + 1) % 100 == 0:
+            conn.commit()
             print(f"    [{i+1:4d}/{len(tickers)}] OK: {succeeded:,}  Propagated: {propagated:,}  No data: {failed:,}  Last: {ticker}")
 
     # Write to DB — update sector (if missing) and industry for each ticker
